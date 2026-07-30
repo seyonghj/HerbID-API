@@ -27,14 +27,22 @@ from flask_cors import CORS
 from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.resnet_v2 import preprocess_input
 
-
+import os
 
 MODEL_PATH = "model/herb_resnet50v2.h5"
 
+print("=" * 50)
+print("Current working directory:", os.getcwd())
+print("Model path:", MODEL_PATH)
 print("Model exists:", os.path.exists(MODEL_PATH))
 
 if os.path.exists(MODEL_PATH):
     print("Model size:", os.path.getsize(MODEL_PATH), "bytes")
+
+    with open(MODEL_PATH, "rb") as f:
+        print("First 16 bytes:", f.read(16))
+
+print("=" * 50)
 
 # ============================================================
 # Configuration
