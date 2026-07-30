@@ -31,18 +31,18 @@ import os
 
 MODEL_PATH = "model/herb_resnet50v2.h5"
 
-print("=" * 50)
-print("Current working directory:", os.getcwd())
-print("Model path:", MODEL_PATH)
-print("Model exists:", os.path.exists(MODEL_PATH))
+print("=" * 60)
+print("Exists:", os.path.exists(MODEL_PATH))
 
 if os.path.exists(MODEL_PATH):
-    print("Model size:", os.path.getsize(MODEL_PATH), "bytes")
+    print("Size:", os.path.getsize(MODEL_PATH))
 
     with open(MODEL_PATH, "rb") as f:
-        print("First 16 bytes:", f.read(16))
+        header = f.read(32)
 
-print("=" * 50)
+    print("Header:", header)
+
+print("=" * 60)
 
 # ============================================================
 # Configuration
