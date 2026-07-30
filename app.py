@@ -50,7 +50,7 @@ MAX_IMAGE_SIZE = 10 * 1024 * 1024   # 10 MB
 CLASS_FILE = "class_names.json"
 
 # Model download URL (configurable via environment variable)
-MODEL_URL = os.environ.get("MODEL_URL", "")
+MODEL_URL = os.getenv("MODEL_URL")
 
 # Minimum plausible size for a valid HDF5 Keras model (in bytes).
 # Real HerbID model is expected to be well over 100 MB.
