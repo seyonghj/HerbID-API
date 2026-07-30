@@ -9,7 +9,10 @@
 import os
 import io
 import json
+import time
 import logging
+import threading
+import urllib.request
 from datetime import datetime
 
 import numpy as np
@@ -24,32 +27,11 @@ from flask import (
 
 from flask_cors import CORS
 
-from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.resnet_v2 import preprocess_input
-
-import os
-
-MODEL_PATH = "model/herb_resnet50v2.h5"
-
-print("=" * 60)
-print("Exists:", os.path.exists(MODEL_PATH))
-
-if os.path.exists(MODEL_PATH):
-    print("Size:", os.path.getsize(MODEL_PATH))
-
-    with open(MODEL_PATH, "rb") as f:
-        header = f.read(32)
-
-    print("Header:", header)
-
-print("=" * 60)
 
 # ============================================================
 # Configuration
 # ============================================================
-
-MODEL_PATH = "model/herb_resnet50v2.h5"
-CLASS_FILE = "class_names.json"
 
 IMG_WIDTH = 224
 IMG_HEIGHT = 224
@@ -64,6 +46,42 @@ ALLOWED_EXTENSIONS = {
 }
 
 MAX_IMAGE_SIZE = 10 * 1024 * 1024   # 10 MB
+
+CLASS_FILE = "class_names.json"
+
+# Model download URL (configurable via environment variable)
+MODEL_URL = os.environ.get("MODEL_URL", "")
+
+# Minimum plausible size for a valid HDF5 Keras model (in bytes).
+# Real HerbID model is expected to be well over 100 MB.
+MIN_MODEL_SIZE = 100 * 1024 * 1024   # 100 MB
+
+# HDF5 file signature (first 8 bytes of any valid .h5 file)
+HDF5_SIGNATURE = b"\x89HDF\r\n\x1a\n"
+
+
+def resolve_model_path():
+    """
+    Railway-compatible model path resolution.
+
+    - If a Railway Volume is mounted at /data, store/load the model there
+      so it survives redeploys.
+    - Otherwise fall back to the local ./model directory for local dev,
+      Docker, Render, etc.
+    """
+    railway_volume_dir = "/data"
+
+    if os.path.isdir(railway_volume_dir):
+        model_dir = os.path.join(railway_volume_dir, "model")
+    else:
+        model_dir = "model"
+
+    os.makedirs(model_dir, exist_ok=True)
+
+    return os.path.join(model_dir, "herb_resnet50v2.h5")
+
+
+MODEL_PATH = os.environ.get("MODEL_PATH", "") or resolve_model_path()
 
 # ============================================================
 # Flask
@@ -144,19 +162,175 @@ HERB_METADATA = {
 }
 
 # ============================================================
-# Load TensorFlow Model
+# Lazy, Thread-Safe Model Loading
+# ============================================================
+#
+# The model is NOT loaded at import time. This keeps Flask import
+# fast and crash-free even if the model file is missing or the
+# download source is temporarily unreachable. The model is loaded
+# on first use (first /identify request, or first call to
+# get_model()), then cached in memory for the lifetime of the
+# process.
 # ============================================================
 
-logger.info("Loading TensorFlow model...")
+MODEL = None
+MODEL_LOCK = threading.Lock()
 
-MODEL = load_model(MODEL_PATH)
+
+def is_valid_model_file(path):
+    """
+    Verify a model file on disk actually looks like a usable
+    Keras/HDF5 model before we try to load it with TensorFlow.
+    """
+
+    if not os.path.exists(path):
+        logger.info("Model file does not exist: %s", path)
+        return False
+
+    size = os.path.getsize(path)
+
+    if size < MIN_MODEL_SIZE:
+        logger.warning(
+            "Model file is too small (%.2f MB) - likely corrupt or incomplete: %s",
+            size / (1024 * 1024),
+            path
+        )
+        return False
+
+    try:
+        with open(path, "rb") as f:
+            header = f.read(8)
+    except OSError as exc:
+        logger.warning("Could not read model file header: %s", exc)
+        return False
+
+    if header != HDF5_SIGNATURE:
+        logger.warning(
+            "Model file does not have a valid HDF5 signature: %s (header=%r)",
+            path,
+            header
+        )
+        return False
+
+    logger.info(
+        "Model file verified OK (%.2f MB): %s",
+        size / (1024 * 1024),
+        path
+    )
+
+    return True
 
 
-def warm_up_model():
+def download_model(path):
+    """
+    Download the model file from MODEL_URL to `path`, streaming to
+    disk with periodic progress logging. Downloads to a temporary
+    file first and only renames to the final path on success, so a
+    failed/partial download never leaves a bad file at `path`.
+    """
 
-    if MODEL is None:
-        logger.warning("Model is not available for warm-up.")
+    if not MODEL_URL:
+        raise RuntimeError(
+            "Model file is missing/invalid and MODEL_URL is not set. "
+            "Set the MODEL_URL environment variable to a direct "
+            "download link for herb_resnet50v2.h5."
+        )
+
+    logger.info("Downloading model from MODEL_URL to %s ...", path)
+
+    tmp_path = path + ".part"
+
+    try:
+        with urllib.request.urlopen(MODEL_URL) as response:
+
+            total_size = int(response.headers.get("Content-Length", 0))
+            downloaded = 0
+            chunk_size = 1024 * 1024  # 1 MB
+            last_log_time = time.time()
+
+            with open(tmp_path, "wb") as out_file:
+
+                while True:
+
+                    chunk = response.read(chunk_size)
+
+                    if not chunk:
+                        break
+
+                    out_file.write(chunk)
+                    downloaded += len(chunk)
+
+                    now = time.time()
+
+                    if now - last_log_time >= 2:
+
+                        if total_size:
+                            percent = (downloaded / total_size) * 100
+                            logger.info(
+                                "Download progress: %.2f MB / %.2f MB (%.1f%%)",
+                                downloaded / (1024 * 1024),
+                                total_size / (1024 * 1024),
+                                percent
+                            )
+                        else:
+                            logger.info(
+                                "Download progress: %.2f MB",
+                                downloaded / (1024 * 1024)
+                            )
+
+                        last_log_time = now
+
+        logger.info(
+            "Download complete: %.2f MB total.",
+            downloaded / (1024 * 1024)
+        )
+
+    except Exception as exc:
+        logger.exception("Model download failed: %s", exc)
+
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+        raise
+
+    os.replace(tmp_path, path)
+
+
+def ensure_model_file():
+    """
+    Make sure a valid model file exists at MODEL_PATH, downloading
+    (or re-downloading) it if necessary.
+    """
+
+    logger.info("Checking model file at %s", MODEL_PATH)
+
+    if is_valid_model_file(MODEL_PATH):
+        logger.info("Existing model file is valid, skipping download.")
         return
+
+    if os.path.exists(MODEL_PATH):
+        logger.warning(
+            "Existing model file is invalid/corrupt. Deleting: %s",
+            MODEL_PATH
+        )
+        try:
+            os.remove(MODEL_PATH)
+        except OSError as exc:
+            logger.warning("Could not remove invalid model file: %s", exc)
+
+    download_model(MODEL_PATH)
+
+    if not is_valid_model_file(MODEL_PATH):
+        raise RuntimeError(
+            "Downloaded model file failed validation. "
+            "Check MODEL_URL and try again."
+        )
+
+
+def warm_up_model(model):
 
     try:
         dummy_input = np.zeros(
@@ -164,15 +338,62 @@ def warm_up_model():
             dtype=np.float32
         )
         dummy_input = preprocess_input(dummy_input)
-        MODEL.predict(dummy_input, verbose=0)
+        model.predict(dummy_input, verbose=0)
         logger.info("Model warm-up completed.")
     except Exception as exc:
         logger.warning("Model warm-up failed: %s", exc)
 
 
-warm_up_model()
+def get_model():
+    """
+    Thread-safe singleton accessor for the TensorFlow model.
 
-logger.info("Model loaded successfully.")
+    - First caller triggers verification/download (if needed) and
+      the actual TensorFlow load.
+    - All subsequent callers (including concurrent requests) reuse
+      the already-loaded model instance.
+    - TensorFlow itself is only imported here, on first use, so
+      Flask import/startup never depends on TensorFlow being ready.
+    """
+
+    global MODEL
+
+    if MODEL is not None:
+        return MODEL
+
+    with MODEL_LOCK:
+
+        # Re-check in case another thread loaded it while we waited
+        # for the lock.
+        if MODEL is not None:
+            return MODEL
+
+        ensure_model_file()
+
+        logger.info("Loading TensorFlow model into memory...")
+
+        start_time = time.time()
+
+        # Imported lazily so a missing/broken TensorFlow install (or
+        # slow import) never blocks Flask from starting up and
+        # serving /  and /health.
+        from tensorflow.keras.models import load_model as _load_model
+
+        loaded_model = _load_model(MODEL_PATH)
+
+        elapsed = time.time() - start_time
+
+        logger.info(
+            "TensorFlow model loaded successfully in %.2f seconds.",
+            elapsed
+        )
+
+        warm_up_model(loaded_model)
+
+        MODEL = loaded_model
+
+        return MODEL
+
 
 # ============================================================
 # Utilities
@@ -300,9 +521,11 @@ def preprocess_image(image):
 
 def predict(image):
 
+    model = get_model()
+
     tensor = preprocess_image(image)
 
-    prediction = MODEL.predict(
+    prediction = model.predict(
 
         tensor,
 
@@ -637,9 +860,11 @@ def startup():
     logger.info("=" * 60)
 
     logger.info(f"Model Path : {MODEL_PATH}")
+    logger.info(f"Model URL  : {'set' if MODEL_URL else 'NOT SET'}")
     logger.info(f"Classes    : {len(CLASS_NAMES)}")
     logger.info(f"Image Size : {IMG_WIDTH}x{IMG_HEIGHT}")
     logger.info(f"Threshold  : {CONFIDENCE_THRESHOLD}")
+    logger.info("Model will be loaded lazily on first /identify request.")
 
     try:
 
