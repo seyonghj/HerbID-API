@@ -16,6 +16,7 @@ import urllib.request
 from datetime import datetime
 
 import numpy as np
+import cv2
 
 from PIL import Image
 
@@ -46,6 +47,29 @@ ALLOWED_EXTENSIONS = {
 }
 
 MAX_IMAGE_SIZE = 10 * 1024 * 1024   # 10 MB
+
+# ── Auto-crop-to-subject ──
+# Automatically detects the herb in the photo and crops tightly around
+# it (via GrabCut foreground segmentation) before it's resized and fed
+# to the model. This removes background/table/hand/clutter so the
+# classifier sees mostly leaf. Can be disabled with an env var if it
+# ever causes trouble on a particular deployment.
+ENABLE_SMART_CROP = os.getenv("ENABLE_SMART_CROP", "true").lower() == "true"
+
+# Working resolution for the GrabCut pass. Larger = more accurate edges
+# but slower; smaller = faster but coarser. 400px is a good tradeoff.
+SMART_CROP_WORK_SIZE = 400
+
+# Extra margin added around the detected subject so leaf tips/edges
+# aren't clipped, as a fraction of the detected box's width/height.
+SMART_CROP_PADDING_RATIO = 0.08
+
+# If the detected foreground is smaller than this fraction of the
+# frame, treat it as noise (nothing confidently detected) and skip
+# cropping. If it's larger than 0.97, the "subject" is basically the
+# whole photo already, so cropping wouldn't help either.
+SMART_CROP_MIN_AREA_RATIO = 0.03
+SMART_CROP_MAX_AREA_RATIO = 0.97
 
 CLASS_FILE = "class_names.json"
 
@@ -481,6 +505,112 @@ def load_image(file):
         raise ValueError("Invalid image file.") from exc
 
 
+def smart_crop_to_subject(image):
+    """
+    Automatically crop a PIL RGB image tightly around its main subject
+    (the herb) using OpenCV's GrabCut foreground segmentation.
+
+    Assumes the subject is roughly centered in frame, which holds for
+    typical "hold the herb up to the camera" / "herb on a table"
+    capture styles. Runs on a small downscaled copy for speed, then
+    maps the detected box back to full resolution.
+
+    Falls back to returning the original, uncropped image whenever:
+      - the feature is disabled via ENABLE_SMART_CROP
+      - GrabCut raises an error (bad/edge-case image data)
+      - the detected foreground is implausibly small or implausibly
+        large (i.e. segmentation didn't find a distinct subject)
+
+    This is a preprocessing step only — it never fails the request;
+    worst case, the model just sees the original uncropped photo,
+    same as before this feature existed.
+    """
+
+    if not ENABLE_SMART_CROP:
+        return image
+
+    try:
+        rgb = np.array(image)
+        h, w = rgb.shape[:2]
+
+        if h < 32 or w < 32:
+            return image
+
+        # Downscale for a fast GrabCut pass
+        scale = SMART_CROP_WORK_SIZE / max(h, w)
+        scale = min(scale, 1.0)
+        sw, sh = max(1, int(w * scale)), max(1, int(h * scale))
+        small = cv2.resize(rgb, (sw, sh), interpolation=cv2.INTER_AREA)
+        bgr = cv2.cvtColor(small, cv2.COLOR_RGB2BGR)
+
+        mask = np.zeros((sh, sw), np.uint8)
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+
+        # Prior: subject occupies roughly the central 84% of the frame.
+        # GrabCut refines this into an actual foreground/background mask.
+        margin_x = max(1, int(sw * 0.08))
+        margin_y = max(1, int(sh * 0.08))
+        rect = (margin_x, margin_y, sw - 2 * margin_x, sh - 2 * margin_y)
+
+        cv2.grabCut(
+            bgr, mask, rect,
+            bgd_model, fgd_model,
+            5,
+            cv2.GC_INIT_WITH_RECT
+        )
+
+        fg_mask = np.where(
+            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
+            1, 0
+        ).astype(np.uint8)
+
+        area_ratio = fg_mask.sum() / float(sh * sw)
+
+        if area_ratio < SMART_CROP_MIN_AREA_RATIO or area_ratio > SMART_CROP_MAX_AREA_RATIO:
+            logger.info(
+                "Smart crop skipped (foreground ratio %.3f out of range).",
+                area_ratio
+            )
+            return image
+
+        ys, xs = np.where(fg_mask == 1)
+        x0, x1 = float(xs.min()), float(xs.max())
+        y0, y1 = float(ys.min()), float(ys.max())
+
+        # Map bounding box back to full-resolution coordinates
+        x0, x1 = x0 / scale, x1 / scale
+        y0, y1 = y0 / scale, y1 / scale
+
+        # Pad so we don't clip thin leaf tips/edges right at the border
+        box_w = x1 - x0
+        box_h = y1 - y0
+        pad_x = box_w * SMART_CROP_PADDING_RATIO
+        pad_y = box_h * SMART_CROP_PADDING_RATIO
+
+        x0 = max(0, int(x0 - pad_x))
+        y0 = max(0, int(y0 - pad_y))
+        x1 = min(w, int(x1 + pad_x))
+        y1 = min(h, int(y1 + pad_y))
+
+        if (x1 - x0) < 20 or (y1 - y0) < 20:
+            logger.info("Smart crop skipped (resulting box too small).")
+            return image
+
+        logger.info(
+            "Smart crop applied: (%d,%d)-(%d,%d) of %dx%d original.",
+            x0, y0, x1, y1, w, h
+        )
+
+        return image.crop((x0, y0, x1, y1))
+
+    except Exception as exc:
+        # Never let a segmentation edge-case break identification —
+        # just fall back to the full, uncropped photo.
+        logger.warning("Smart crop failed, using original image: %s", exc)
+        return image
+
+
 def preprocess_image(image):
 
     """
@@ -523,7 +653,9 @@ def predict(image):
 
     model = get_model()
 
-    tensor = preprocess_image(image)
+    cropped_image = smart_crop_to_subject(image)
+
+    tensor = preprocess_image(cropped_image)
 
     prediction = model.predict(
 
