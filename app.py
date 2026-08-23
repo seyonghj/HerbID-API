@@ -9,12 +9,14 @@
 import os
 import io
 import json
+import base64
 import time
 import logging
 import threading
 import urllib.request
 from datetime import datetime
 
+import google.generativeai as genai
 import numpy as np
 
 from PIL import Image
@@ -92,6 +94,8 @@ app = Flask(__name__)
 CORS(app)
 
 app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_SIZE
+
+genai.configure(api_key=os.environ.get("GEMINI_KEY"))
 
 # ============================================================
 # Logging
@@ -766,6 +770,36 @@ def identify():
             "error": message
 
         }), 500
+
+
+# ============================================================
+# Gemini Verification Endpoint
+# ============================================================
+
+@app.route("/gemini-verify", methods=["POST"])
+def gemini_verify():
+
+    try:
+
+        data = request.get_json()
+        image_b64 = data.get("image")
+        mime_type = data.get("mimeType", "image/jpeg")
+        prompt = data.get("prompt")
+
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        response = model.generate_content([
+            {"mime_type": mime_type, "data": image_b64},
+            prompt
+        ])
+
+        text = response.text
+        clean = text.replace("```json", "").replace("```", "").strip()
+
+        return json.loads(clean)
+
+    except Exception as exc:
+
+        return {"error": str(exc)}, 500
 
 
 # ============================================================
