@@ -441,7 +441,7 @@ def gemini_verify():
         if not image_b64 or not prompt:
             return jsonify({"error": "Missing image or prompt"}), 400
 
-        model    = genai.GenerativeModel("gemini-2.5-flash")
+        model    = genai.GenerativeModel("gemini-3.6-flash")
         response = model.generate_content([
             {"mime_type": mime_type, "data": image_b64},
             prompt
