@@ -83,7 +83,26 @@ app = Flask(__name__)
 CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_SIZE
 
-genai.configure(api_key=os.environ.get("GEMINI_KEY"))
+# ── Gemini key rotation ───────────────────────────────────
+# Collect all keys from env: GEMINI_KEY, GEMINI_KEY_1, GEMINI_KEY_2, ...
+# If one key hits its daily quota (429 / Resource Exhausted), the route
+# automatically tries the next key in the list.
+_GEMINI_KEYS = [
+    k for k in [
+        os.environ.get("GEMINI_KEY"),
+        os.environ.get("GEMINI_KEY_1"),
+        os.environ.get("GEMINI_KEY_2"),
+        os.environ.get("GEMINI_KEY_3"),
+        os.environ.get("GEMINI_KEY_4"),
+        os.environ.get("GEMINI_KEY_5"),
+    ] if k
+]
+if not _GEMINI_KEYS:
+    logger.warning("No Gemini API keys found in environment variables.")
+
+# Configure with the first key by default (used by non-rotating code paths)
+if _GEMINI_KEYS:
+    genai.configure(api_key=_GEMINI_KEYS[0])
 
 # ============================================================
 # Logging
@@ -594,34 +613,65 @@ def identify():
 
 @app.route("/gemini-verify", methods=["POST"])
 def gemini_verify():
-    try:
-        data = request.get_json(force=True)
-        if not data:
-            return jsonify({"error": "No JSON body received"}), 400
+    if not _GEMINI_KEYS:
+        return jsonify({"error": "No Gemini API keys configured on the server."}), 500
 
-        image_b64 = data.get("image")
-        mime_type = data.get("mimeType", "image/jpeg")
-        prompt    = data.get("prompt")
+    data = request.get_json(force=True)
+    if not data:
+        return jsonify({"error": "No JSON body received"}), 400
 
-        if not image_b64 or not prompt:
-            return jsonify({"error": "Missing image or prompt"}), 400
+    image_b64 = data.get("image")
+    mime_type = data.get("mimeType", "image/jpeg")
+    prompt    = data.get("prompt")
 
-        model    = genai.GenerativeModel("gemini-3.6-flash")
-        response = model.generate_content([
-            {"mime_type": mime_type, "data": image_b64},
-            prompt
-        ])
+    if not image_b64 or not prompt:
+        return jsonify({"error": "Missing image or prompt"}), 400
 
-        text  = response.text
-        clean = text.replace("```json", "").replace("```", "").strip()
-        return jsonify(json.loads(clean))
+    last_error = None
+    text       = None
 
-    except json.JSONDecodeError as exc:
-        logger.warning("Gemini non-JSON: %s", exc)
-        return jsonify({"error": "Gemini returned invalid JSON", "raw": text}), 500
-    except Exception as exc:
-        logger.exception("Gemini verify failed")
-        return jsonify({"error": str(exc)}), 500
+    # Try each key in order — stops as soon as one succeeds.
+    # Skips to the next key on quota errors (429 / ResourceExhausted).
+    for idx, api_key in enumerate(_GEMINI_KEYS):
+        try:
+            genai.configure(api_key=api_key)
+            model    = genai.GenerativeModel("gemini-3.6-flash")
+            response = model.generate_content([
+                {"mime_type": mime_type, "data": image_b64},
+                prompt
+            ])
+            text  = response.text
+            clean = text.replace("```json", "").replace("```", "").strip()
+
+            try:
+                result = json.loads(clean)
+            except json.JSONDecodeError:
+                logger.warning("Gemini key %d returned non-JSON: %.200s", idx + 1, text)
+                return jsonify({"error": "Gemini returned invalid JSON", "raw": text}), 500
+
+            if idx > 0:
+                logger.info("Gemini succeeded on key %d (keys 1–%d exhausted)", idx + 1, idx)
+            return jsonify(result)
+
+        except Exception as exc:
+            err_str = str(exc).lower()
+            # 429 / quota exhausted / resource exhausted → try next key
+            if any(kw in err_str for kw in ["429", "quota", "resource exhausted", "rate limit"]):
+                logger.warning(
+                    "Gemini key %d quota hit (%s) — trying next key", idx + 1, str(exc)[:120]
+                )
+                last_error = exc
+                continue
+            # Any other error (bad key, network, model error) → fail immediately
+            logger.exception("Gemini key %d failed with non-quota error", idx + 1)
+            return jsonify({"error": str(exc)}), 500
+
+    # All keys exhausted
+    logger.error("All %d Gemini keys quota-exhausted. Last error: %s", len(_GEMINI_KEYS), last_error)
+    return jsonify({
+        "error": f"All {len(_GEMINI_KEYS)} Gemini API key(s) have reached their daily quota. Please try again after midnight Pacific Time.",
+        "quota_exhausted": True,
+    }), 429
 
 
 # ============================================================
