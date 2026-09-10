@@ -6,3 +6,4 @@ Pillow==10.3.0
 gunicorn==22.0.0
 h5py==3.11.0
 google-generativeai
+Pillow>=9.0
