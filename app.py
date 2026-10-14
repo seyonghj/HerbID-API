@@ -532,10 +532,11 @@ def build_prediction_response(prediction):
     norm_entropy = entropy / max_entropy   # 0 = certain, 1 = random
 
     # If entropy is very high (model is confused) treat as no match
-    uncertain = norm_entropy > 0.75
+    # Cast to plain Python bool — NumPy bool_ is not JSON serializable
+    uncertain = bool(norm_entropy > 0.75)
 
     return {
-        "matched":           (confidence >= CONFIDENCE_THRESHOLD) and not uncertain,
+        "matched":           bool((confidence >= CONFIDENCE_THRESHOLD) and not uncertain),
         "localName":         herb_name,
         "confidence":        confidence,
         "confidencePercent": confidence_pct,
@@ -620,29 +621,44 @@ def gemini_verify():
     if not data:
         return jsonify({"error": "No JSON body received"}), 400
 
-    image_b64 = data.get("image")
-    mime_type = data.get("mimeType", "image/jpeg")
-    prompt    = data.get("prompt")
+    image_b64  = data.get("image")
+    mime_type  = data.get("mimeType", "image/jpeg")
+    prompt     = data.get("prompt")
+    text_only  = data.get("textOnly", False)  # ✅ translation mode — no image needed
 
-    if not image_b64 or not prompt:
-        return jsonify({"error": "Missing image or prompt"}), 400
+    if not prompt:
+        return jsonify({"error": "Missing prompt"}), 400
+
+    # text_only mode (e.g. translation) — image not required
+    if not text_only and not image_b64:
+        return jsonify({"error": "Missing image"}), 400
 
     last_error = None
-    text       = None
 
-    # Try each key in order — stops as soon as one succeeds.
-    # Skips to the next key on quota errors (429 / ResourceExhausted).
     for idx, api_key in enumerate(_GEMINI_KEYS):
         try:
             genai.configure(api_key=api_key)
-            model    = genai.GenerativeModel("gemini-3.6-flash")
-            response = model.generate_content([
-                {"mime_type": mime_type, "data": image_b64},
-                prompt
-            ])
+            model = genai.GenerativeModel("gemini-3.6-flash")
+
+            if text_only:
+                # Text-only request — no image sent to Gemini
+                response = model.generate_content(prompt)
+            else:
+                response = model.generate_content([
+                    {"mime_type": mime_type, "data": image_b64},
+                    prompt
+                ])
+
             text  = response.text
             clean = text.replace("```json", "").replace("```", "").strip()
 
+            # For text-only (translation), return raw text directly
+            if text_only:
+                if idx > 0:
+                    logger.info("Gemini (text) succeeded on key %d", idx + 1)
+                return jsonify({"translation": clean})
+
+            # For image requests, try to parse as JSON
             try:
                 result = json.loads(clean)
             except json.JSONDecodeError:
@@ -655,21 +671,16 @@ def gemini_verify():
 
         except Exception as exc:
             err_str = str(exc).lower()
-            # 429 / quota exhausted / resource exhausted → try next key
             if any(kw in err_str for kw in ["429", "quota", "resource exhausted", "rate limit"]):
-                logger.warning(
-                    "Gemini key %d quota hit (%s) — trying next key", idx + 1, str(exc)[:120]
-                )
+                logger.warning("Gemini key %d quota hit — trying next key", idx + 1)
                 last_error = exc
                 continue
-            # Any other error (bad key, network, model error) → fail immediately
             logger.exception("Gemini key %d failed with non-quota error", idx + 1)
             return jsonify({"error": str(exc)}), 500
 
-    # All keys exhausted
-    logger.error("All %d Gemini keys quota-exhausted. Last error: %s", len(_GEMINI_KEYS), last_error)
+    logger.error("All %d Gemini keys quota-exhausted.", len(_GEMINI_KEYS))
     return jsonify({
-        "error": f"All {len(_GEMINI_KEYS)} Gemini API key(s) have reached their daily quota. Please try again after midnight Pacific Time.",
+        "error": f"All {len(_GEMINI_KEYS)} Gemini API key(s) have reached their daily quota. Try again after midnight Pacific Time.",
         "quota_exhausted": True,
     }), 429
 
